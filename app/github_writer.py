@@ -17,6 +17,7 @@ from typing import Optional
 
 from github import Github, GithubException
 from github.ContentFile import ContentFile
+from github.InputGitTreeElement import InputGitTreeElement
 from github.Repository import Repository
 
 logger = logging.getLogger(__name__)
@@ -193,12 +194,12 @@ class GitHubWriter:
                 )
 
             tree_elements.append(
-                {
-                    "path": change.path,
-                    "mode": "100644",
-                    "type": "blob",
-                    "sha": blob.sha,
-                }
+                InputGitTreeElement(
+                    path=change.path,
+                    mode="100644",
+                    type="blob",
+                    sha=blob.sha,
+                )
             )
 
         # Create a new tree

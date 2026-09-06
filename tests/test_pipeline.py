@@ -357,6 +357,183 @@ class TestGeminiTagger:
             assert "FAILED TO TAG" in result.attributes.notes
 
 
+# ─── GitHub Writer commit_batch Regression Tests ─────────────────────────────
+
+class TestGitHubWriterCommitBatch:
+    """
+    Regression tests for github_writer.py commit_batch().
+
+    These tests exercise the real PyGithub assertion boundary for
+    create_git_tree() — NOT a fully mocked GitHubWriter. If someone
+    accidentally swaps InputGitTreeElement back for a plain dict,
+    these tests will fail immediately.
+    """
+
+    def _make_writer(self):
+        """
+        Build a GitHubWriter with a mocked repo object that still runs
+        the real create_git_tree assertion against the elements we pass.
+        """
+        from unittest.mock import MagicMock
+        from github.InputGitTreeElement import InputGitTreeElement
+        import github
+
+        with patch("app.github_writer.Github") as MockGH:
+            mock_repo = MagicMock()
+            mock_repo.full_name = "testuser/testrepo"
+            MockGH.return_value.get_repo.return_value = mock_repo
+
+            from app.github_writer import GitHubWriter
+            writer = GitHubWriter(
+                token="fake-token",
+                repo_name="testuser/testrepo",
+                branch="main",
+                image_assets_path="images",
+            )
+
+        return writer, mock_repo
+
+    def test_commit_batch_passes_InputGitTreeElement_not_dict(self):
+        """
+        REGRESSION: create_git_tree() must receive InputGitTreeElement
+        instances, not plain dicts. PyGithub asserts this and raises
+        AssertionError on plain dicts.
+        """
+        from github.InputGitTreeElement import InputGitTreeElement
+
+        writer, mock_repo = self._make_writer()
+
+        # Set up the mock chain for a commit
+        mock_ref = MagicMock()
+        mock_ref.object.sha = "base-sha-123"
+        mock_repo.get_git_ref.return_value = mock_ref
+
+        mock_base_commit = MagicMock()
+        mock_base_commit.tree.sha = "tree-sha-456"
+        mock_repo.get_git_commit.return_value = mock_base_commit
+
+        # Mock create_git_blob to return a fake blob with a SHA
+        mock_blob = MagicMock()
+        mock_blob.sha = "blob-sha-789"
+        mock_repo.create_git_blob.return_value = mock_blob
+
+        # Mock create_git_tree — but RUN THE REAL PYGITHUB ASSERTION
+        # This is the critical check: if tree_elements contains dicts
+        # instead of InputGitTreeElement, this will raise AssertionError.
+        def real_create_git_tree(elements, base_tree=None):
+            # Replicate the exact assertion from PyGithub's source
+            assert all(
+                isinstance(e, InputGitTreeElement) for e in elements
+            ), f"Expected InputGitTreeElement, got: {[type(e).__name__ for e in elements]}"
+            mock_tree = MagicMock()
+            mock_tree.sha = "new-tree-sha"
+            return mock_tree
+
+        mock_repo.create_git_tree.side_effect = real_create_git_tree
+
+        mock_new_commit = MagicMock()
+        mock_new_commit.sha = "new-commit-sha-abc"
+        mock_repo.create_git_commit.return_value = mock_new_commit
+
+        # Queue a text change and an image (exercises both code paths)
+        writer.update_file("wardrobe.json", '{"items": []}', "")
+        writer.queue_image("FS01", b"\x89PNG\r\n fake image bytes")
+
+        # This must NOT raise AssertionError
+        sha = writer.commit_batch("Add items: FS01 (2 photos processed)")
+
+        assert sha == "new-commit-sha-abc"
+        # Verify create_git_tree was called with proper InputGitTreeElements
+        call_args = mock_repo.create_git_tree.call_args
+        elements = call_args[0][0]
+        assert len(elements) == 2
+        for elem in elements:
+            assert isinstance(elem, InputGitTreeElement), (
+                f"Expected InputGitTreeElement, got {type(elem).__name__}. "
+                "commit_batch() is building plain dicts again!"
+            )
+
+    def test_commit_batch_element_paths_and_modes(self):
+        """Verify tree elements have correct path, mode, type, and sha."""
+        from github.InputGitTreeElement import InputGitTreeElement
+
+        writer, mock_repo = self._make_writer()
+
+        mock_ref = MagicMock()
+        mock_ref.object.sha = "base-sha"
+        mock_repo.get_git_ref.return_value = mock_ref
+
+        mock_base_commit = MagicMock()
+        mock_base_commit.tree.sha = "tree-sha"
+        mock_repo.get_git_commit.return_value = mock_base_commit
+
+        blob_shas = iter(["sha-text-1", "sha-text-2", "sha-bin-1"])
+        mock_repo.create_git_blob.side_effect = lambda *_: MagicMock(sha=next(blob_shas))
+
+        captured = {}
+
+        def capture_tree(elements, base_tree=None):
+            captured["elements"] = list(elements)
+            return MagicMock(sha="new-tree")
+
+        mock_repo.create_git_tree.side_effect = capture_tree
+        mock_repo.create_git_commit.return_value = MagicMock(sha="commit-sha")
+
+        writer.update_file("wardrobe.json", "{}", "")
+        writer.update_file("data/counters.json", "{}", "")
+        writer.queue_image("TT01", b"\x89PNG image-bytes")
+
+        writer.commit_batch("test commit")
+
+        elements = captured["elements"]
+        assert len(elements) == 3
+
+        # InputGitTreeElement stores attrs as name-mangled private;
+        # the public interface is _identity (the dict PyGithub serializes).
+        e0, e1, e2 = [e._identity for e in elements]
+
+        # Text files
+        assert e0["path"] == "wardrobe.json"
+        assert e0["mode"] == "100644"
+        assert e0["type"] == "blob"
+        assert e0["sha"] == "sha-text-1"
+
+        assert e1["path"] == "data/counters.json"
+        assert e1["sha"] == "sha-text-2"
+
+        # Image file
+        assert e2["path"] == "images/TT01.png"
+        assert e2["sha"] == "sha-bin-1"
+
+    def test_commit_batch_empty_returns_none(self):
+        """commit_batch returns None when there's nothing to commit."""
+        writer, mock_repo = self._make_writer()
+        assert writer.commit_batch("nothing") is None
+        mock_repo.create_git_tree.assert_not_called()
+
+    def test_commit_batch_clears_pending_after_commit(self):
+        """Pending changes are cleared after a successful commit."""
+        writer, mock_repo = self._make_writer()
+
+        mock_ref = MagicMock()
+        mock_ref.object.sha = "base"
+        mock_repo.get_git_ref.return_value = mock_ref
+
+        mock_base_commit = MagicMock()
+        mock_base_commit.tree.sha = "tree"
+        mock_repo.get_git_commit.return_value = mock_base_commit
+
+        mock_repo.create_git_blob.return_value = MagicMock(sha="b-sha")
+        mock_repo.create_git_tree.return_value = MagicMock(sha="t-sha")
+        mock_repo.create_git_commit.return_value = MagicMock(sha="c-sha")
+
+        writer.update_file("test.json", "data", "")
+        assert writer.pending_count == 1
+
+        writer.commit_batch("test")
+        assert writer.pending_count == 0
+
+
 # ─── Full Pipeline Integration Test ─────────────────────────────────────────
 
 class TestPipelineIntegration:
