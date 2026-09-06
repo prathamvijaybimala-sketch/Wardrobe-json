@@ -116,9 +116,36 @@ To run `/sync` automatically (e.g. every 6 hours):
 | `GET` | `/health` | Health check — returns `{"status": "ok"}` |
 | `POST` | `/sync` | Trigger a full pipeline run |
 
+### /sync response
+
+```json
+{
+  "success": true,
+  "new_images_found": 3,
+  "items_processed": 3,
+  "items_failed": 0,
+  "commit_sha": "abc123def456...",
+  "duration_seconds": 12.34,
+  "item_details": [
+    {
+      "id": "FS04",
+      "drive_file_id": "1abc...",
+      "drive_filename": "shirt_photo.png",
+      "category": "full_sleeve_shirt",
+      "color": "dark grey",
+      "status": "ok",
+      "review_reason": null
+    }
+  ],
+  "message": "Processed 3 items from 3 new photos in 12.3s"
+}
+```
+
+Items with `status: "review_needed"` were flagged because Gemini couldn't confidently categorize them — check the `review_reason` field and manually edit `wardrobe.json` if needed.
+
 ## Consumer Contract
 
-Any downstream app (outfit picker, etc.) can consume the catalog with zero dependencies:
+Any downstream app (outfit picker, etc.) can consume the catalog with zero dependencies — no API keys, no auth, just raw GitHub URLs.
 
 ### Fetch the catalog
 
@@ -147,15 +174,59 @@ GET https://raw.githubusercontent.com/<owner>/<repo>/<branch>/wardrobe.json
 }
 ```
 
+### Field reference
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | string | Deterministic ID (e.g. `FS04`). Always `<PREFIX><2-digit number>`. |
+| `category` | string | One of the enum values: `full_sleeve_shirt`, `half_sleeve_shirt`, `t_shirt`, `polo`, `tank_top`, `jeans`, `trousers`, `shorts`, `jacket`, `blazer`, `hoodie`, `sweatshirt`, `dress`, `skirt`, `other` |
+| `color` | string | Free-text color description (e.g. `"dark navy blue"`) |
+| `pattern` | string | One of: `none`, `solid`, `striped`, `plaid`, `checked`, `floral`, `graphic_print`, `denim`, `camouflage`, `polka_dot`, `other` |
+| `sleeve_type` | string | One of: `full`, `half`, `three_quarter`, `sleeveless`, `short`, `n/a` |
+| `fit` | string | One of: `regular`, `slim`, `loose`, `oversized`, `tapered`, `straight`, `not_visible` |
+| `material_guess` | string | Best-guess material (e.g. `"cotton"`, `"denim"`, `"wool blend"`) |
+| `notes` | string | Free-text: collar type, pockets, logos, distinctive features |
+| `image_url` | string | Full URL to the item's PNG image on `raw.githubusercontent.com` |
+| `date_added` | string | ISO date (YYYY-MM-DD) when the item was cataloged |
+
 ### Build image URLs
 
+Images are stored at:
 ```
 https://raw.githubusercontent.com/<owner>/<repo>/<branch>/<IMAGE_ASSETS_PATH>/<id>.png
 ```
 
+Each item's `image_url` field already contains the full URL — you can use it directly.
+
 Example:
 ```
 https://raw.githubusercontent.com/myuser/wardrobe-data/main/images/FS04.png
+```
+
+### Caching & freshness
+
+- `raw.githubusercontent.com` responses are cached by GitHub's CDN (typically 5 minutes `Cache-Control: max-age=300`)
+- The pipeline runs on a schedule (default: every 6 hours via Railway cron)
+- For the freshest data, add a cache-busting query param: `?t=<timestamp>`
+- Items are **never deleted or modified** after being committed — the catalog only grows
+
+### Filtering examples
+
+```javascript
+// Get all shirts
+const shirts = catalog.items.filter(i => i.category.includes('shirt'));
+
+// Get all blue items
+const blueItems = catalog.items.filter(i => i.color.includes('blue'));
+
+// Get items added this month
+const thisMonth = catalog.items.filter(i => i.date_added.startsWith('2026-09'));
+
+// Group by category
+const byCategory = catalog.items.reduce((acc, item) => {
+  (acc[item.category] ??= []).push(item);
+  return acc;
+}, {});
 ```
 
 ## ID Scheme
@@ -178,6 +249,58 @@ IDs are deterministic, generated from category prefix + zero-padded counter:
 | Tank top | `TK` | `TK01` |
 | Blazer | `BZ` | `BZ01` |
 | Other | `OT` | `OT01` |
+
+## Testing
+
+The test suite covers every component with mocked external services:
+
+```bash
+# Install test dependencies
+pip install pytest
+
+# Run all tests
+pytest tests/ -v
+
+# Run a specific test class
+pytest tests/test_pipeline.py::TestIDRegistry -v
+
+# Run with output
+pytest tests/ -v -s
+```
+
+### What's tested
+
+| Area | Tests | Coverage |
+|---|---|---|
+| Config | 4 | Missing vars fail fast, B64/file loading, repo format validation |
+| Schemas | 4 | Enum validation, catalog merge (no overwrites), JSON roundtrip |
+| ID Registry | 6 | Sequential IDs, existing counters, all prefix mappings, collisions |
+| Gemini Tagger | 2 | Successful tagging, validation failure → manual review |
+| Pipeline | 4 | Full run, idempotency (no new images), preserves existing catalog, download failures |
+
+### Integration test (with real APIs)
+
+To run against real Google Drive, Gemini, and GitHub:
+
+```bash
+# Ensure .env is filled with real credentials
+# Then:
+python -c "
+import logging
+logging.basicConfig(level=logging.INFO)
+from app.config import load_settings
+from app.pipeline import run_pipeline
+result = run_pipeline(load_settings())
+print(result)
+"
+```
+
+This will:
+1. List real PNG files from your Drive folder
+2. Tag them with the real Gemini API (uses free-tier quota)
+3. Commit results to your real GitHub repo
+
+Run it twice — the second run should report 0 new images (idempotency check).
 
 ## License
 
