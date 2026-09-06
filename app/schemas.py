@@ -135,6 +135,81 @@ class WardrobeCatalog(BaseModel):
         description="All cataloged wardrobe items."
     )
 
+    def get_item_by_id(self, item_id: str) -> Optional[WardrobeItem]:
+        """Look up an item by its ID."""
+        for item in self.items:
+            if item.id == item_id:
+                return item
+        return None
+
+    def existing_ids(self) -> set[str]:
+        """Return the set of all item IDs currently in the catalog."""
+        return {item.id for item in self.items}
+
+    def merge_items(self, new_items: list[WardrobeItem]) -> list[WardrobeItem]:
+        """
+        Merge new items into the catalog.
+
+        New items are appended. Items whose ID already exists in the catalog
+        are skipped (never overwrite). Returns the list of items that were
+        actually added.
+
+        Args:
+            new_items: Items to add to the catalog.
+
+        Returns:
+            List of items that were actually appended (excludes duplicates).
+        """
+        existing = self.existing_ids()
+        added = []
+        for item in new_items:
+            if item.id in existing:
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"Skipping duplicate ID {item.id} — already in catalog"
+                )
+                continue
+            self.items.append(item)
+            existing.add(item.id)
+            added.append(item)
+        return added
+
+
+def load_catalog_from_json(json_str: str) -> WardrobeCatalog:
+    """
+    Parse a wardrobe.json string into a WardrobeCatalog.
+
+    Args:
+        json_str: JSON string from the GitHub repo.
+
+    Returns:
+        WardrobeCatalog instance. Returns empty catalog if JSON is invalid.
+    """
+    import json as _json
+
+    try:
+        data = _json.loads(json_str)
+        return WardrobeCatalog.model_validate(data)
+    except (_json.JSONDecodeError, Exception) as e:
+        import logging
+        logging.getLogger(__name__).warning(
+            f"Could not parse wardrobe.json, starting with empty catalog: {e}"
+        )
+        return WardrobeCatalog()
+
+
+def catalog_to_json(catalog: WardrobeCatalog) -> str:
+    """
+    Serialize a WardrobeCatalog to pretty-printed JSON.
+
+    Args:
+        catalog: The catalog to serialize.
+
+    Returns:
+        JSON string.
+    """
+    return catalog.model_dump_json(indent=2)
+
 
 # ─── Tagging Result ──────────────────────────────────────────────────────────
 
